@@ -2591,6 +2591,22 @@ export class LRUCache<K extends {}, V extends {}, FC = unknown> {
       }
     }
 
+    // the fetch() already resolved to the stale value, and then the
+    // fetchMethod failed. Drop the pending promise, so that the next
+    // fetch() calls the fetchMethod again.
+    const lateFail = () => {
+      if (this.#valList[index as Index] !== p) return
+      const bf = p as BackgroundFetch<V>
+      const noDelete =
+        options.noDeleteOnFetchRejection ||
+        options.allowStaleOnFetchRejection
+      if (noDelete && bf.__staleWhileFetching !== undefined) {
+        this.#valList[index as Index] = bf.__staleWhileFetching
+      } else {
+        this.#delete(k, 'fetch')
+      }
+    }
+
     const pcall = (
       res: (v: V | undefined) => void,
       rej: (e: unknown) => void,
@@ -2605,11 +2621,15 @@ export class LRUCache<K extends {}, V extends {}, FC = unknown> {
           // when it eventually resolves, update the cache.
           if (options.allowStaleOnFetchAbort) {
             res = v => cb(v, true)
+            rej = lateFail
           }
         }
       })
       if (fmp && fmp instanceof Promise) {
-        fmp.then(v => res(v === undefined ? undefined : v), rej)
+        fmp.then(
+          v => res(v === undefined ? undefined : v),
+          er => rej(er),
+        )
       } else if (fmp !== undefined) {
         res(fmp)
       }

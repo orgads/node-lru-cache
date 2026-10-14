@@ -911,3 +911,60 @@ t.test('dispose() stale value if fetch is evicted', async t => {
   t.strictSame(disposed, disposedAfter)
   t.strictSame(disposed, [[10, 1, 'evict']])
 })
+
+t.test('refetch after aborted fetch rejects later', async t => {
+  let calls = 0
+  let fail = true
+  const c = new LRUCache<number, number, void>({
+    ttl: 10,
+    max: 10,
+    ignoreFetchAbort: true,
+    allowStaleOnFetchAbort: true,
+    allowStaleOnFetchRejection: true,
+    fetchMethod: async k => {
+      calls++
+      return new Promise((res, rej) => {
+        setTimeout(() => (fail ? rej(new Error('fail')) : res(k)), 100)
+      })
+    },
+  })
+  const e = expose(c)
+  c.set(1, 10)
+  clock.advance(100)
+  const ac = new AbortController()
+  const p = c.fetch(1, { signal: ac.signal })
+  await new Promise<void>(res => queueMicrotask(res))
+  ac.abort(new Error('gimme the stale value'))
+  t.equal(await p, 10)
+  clock.advance(200)
+  for (let i = 0; i < 5; i++) await Promise.resolve()
+  t.equal(e.valList[0], 10, 'pending promise replaced by stale value')
+  fail = false
+  const p2 = c.fetch(1)
+  clock.advance(100)
+  t.equal(await p2, 1, 'fetchMethod called again')
+  t.equal(calls, 2)
+})
+
+t.test('aborted fetch rejects later, no stale value kept', async t => {
+  const c = new LRUCache<number, number, void>({
+    ttl: 10,
+    max: 10,
+    ignoreFetchAbort: true,
+    allowStaleOnFetchAbort: true,
+    fetchMethod: async () =>
+      new Promise((_, rej) => {
+        setTimeout(() => rej(new Error('fail')), 100)
+      }),
+  })
+  c.set(1, 10)
+  clock.advance(100)
+  const ac = new AbortController()
+  const p = c.fetch(1, { signal: ac.signal })
+  await new Promise<void>(res => queueMicrotask(res))
+  ac.abort(new Error('gimme the stale value'))
+  t.equal(await p, 10)
+  clock.advance(200)
+  for (let i = 0; i < 5; i++) await Promise.resolve()
+  t.equal(c.has(1), false, 'deleted after the late rejection')
+})
