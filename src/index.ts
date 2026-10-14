@@ -385,6 +385,13 @@ export namespace LRUCache {
     fetchAbortIgnored?: true
 
     /**
+     * The fetchMethod did not settle within
+     * {@link OptionsBase.staleFetchTimeout}, so the stale value was returned
+     * while the fetch continues in the background.
+     */
+    fetchTimedOut?: true
+
+    /**
      * The fetchMethod promise resolved successfully
      */
     fetchResolved?: true
@@ -453,6 +460,7 @@ export namespace LRUCache {
     | 'allowStaleOnFetchRejection'
     | 'ignoreFetchAbort'
     | 'allowStaleOnFetchAbort'
+    | 'staleFetchTimeout'
   > {
     status?: Status<K, V, FC>
     size?: Size
@@ -1140,6 +1148,37 @@ export namespace LRUCache {
     ignoreFetchAbort?: boolean
 
     /**
+     * When {@link LRUCache#fetch} refreshes an entry that has a stale value,
+     * and the {@link OptionsBase.fetchMethod} has not settled after this many
+     * milliseconds, resolve the `fetch()` to the stale value.
+     *
+     * The fetch continues in the background and updates the cache when it
+     * resolves. Until then, other `fetch()` calls for the same key resolve to
+     * the stale value at once. If it rejects, the next `fetch()` calls the
+     * `fetchMethod` again.
+     *
+     * Entries with no stale value are not affected: their `fetch()` waits
+     * for the `fetchMethod` as usual. The `AbortSignal` passed to the
+     * `fetchMethod` is not aborted on timeout.
+     *
+     * This is useful when the backend is usually fast, but sometimes stalls:
+     * fresh data is returned whenever it is available in time, and slow
+     * refreshes do not block callers that can do with the stale value.
+     *
+     * ```ts
+     * const c = new LRUCache({
+     *   ttl: 10_000,
+     *   staleFetchTimeout: 2000,
+     *   fetchMethod: async key => db.lookup(key),
+     * })
+     * ```
+     *
+     * This may be overridden in the {@link OptionsBase.fetchMethod} or the
+     * call to {@link LRUCache#fetch}.
+     */
+    staleFetchTimeout?: Milliseconds
+
+    /**
      * In some cases, you may want to swap out the performance/Date object
      * used for TTL tracking. This should almost certainly NOT be done in
      * production environments!
@@ -1288,6 +1327,10 @@ export class LRUCache<K extends {}, V extends {}, FC = unknown> {
    * {@link LRUCache.OptionsBase.ignoreFetchAbort}
    */
   ignoreFetchAbort: boolean
+  /**
+   * {@link LRUCache.OptionsBase.staleFetchTimeout}
+   */
+  staleFetchTimeout: LRUCache.Milliseconds
 
   /** {@link LRUCache.OptionsBase.backgroundFetchSize} */
   backgroundFetchSize: number
@@ -1446,6 +1489,7 @@ export class LRUCache<K extends {}, V extends {}, FC = unknown> {
       allowStaleOnFetchRejection,
       allowStaleOnFetchAbort,
       ignoreFetchAbort,
+      staleFetchTimeout,
       backgroundFetchSize = 1,
       perf,
     } = options
@@ -1537,6 +1581,12 @@ export class LRUCache<K extends {}, V extends {}, FC = unknown> {
     this.allowStaleOnFetchRejection = !!allowStaleOnFetchRejection
     this.allowStaleOnFetchAbort = !!allowStaleOnFetchAbort
     this.ignoreFetchAbort = !!ignoreFetchAbort
+    this.staleFetchTimeout = staleFetchTimeout || 0
+    if (this.staleFetchTimeout && !isPosInt(this.staleFetchTimeout)) {
+      throw new TypeError(
+        'staleFetchTimeout must be a positive integer if specified',
+      )
+    }
 
     // NB: maxEntrySize is set to maxSize if it's set
     if (this.maxEntrySize !== 0) {
@@ -2511,7 +2561,15 @@ export class LRUCache<K extends {}, V extends {}, FC = unknown> {
       context,
     }
 
+    let timedOut = false
     const cb = (v: V | undefined, updateCache = false): V | undefined => {
+      if (timedOut && !updateCache) {
+        if (options.status) {
+          options.status.fetchTimedOut = true
+          options.status.returnedStale = true
+        }
+        return (p as BackgroundFetch<V>).__staleWhileFetching
+      }
       const { aborted } = ac.signal
       const ignoreAbort = options.ignoreFetchAbort && v !== undefined
       const proceed =
@@ -2612,10 +2670,14 @@ export class LRUCache<K extends {}, V extends {}, FC = unknown> {
       rej: (e: unknown) => void,
     ) => {
       const fmp = this.#fetchMethod?.(k, v, fetchOpts)
+      let timer: ReturnType<typeof setTimeout> | undefined
       // ignored, we go until we finish, regardless.
       // defer check until we are actually aborting,
       // so fetchMethod can override.
       ac.signal.addEventListener('abort', () => {
+        clearTimeout(timer)
+        // fetch() already resolved, the cache is updated when it settles
+        if (timedOut) return
         if (!options.ignoreFetchAbort || options.allowStaleOnFetchAbort) {
           res(undefined)
           // when it eventually resolves, update the cache.
@@ -2626,9 +2688,29 @@ export class LRUCache<K extends {}, V extends {}, FC = unknown> {
         }
       })
       if (fmp && fmp instanceof Promise) {
+        const { staleFetchTimeout } = options
+        if (staleFetchTimeout && v !== undefined) {
+          timer = setTimeout(() => {
+            timedOut = true
+            res(undefined)
+            res = v => cb(v, true)
+            rej = lateFail
+          }, staleFetchTimeout)
+          /* c8 ignore start */
+          if (timer.unref) {
+            timer.unref()
+          }
+          /* c8 ignore stop */
+        }
         fmp.then(
-          v => res(v === undefined ? undefined : v),
-          er => rej(er),
+          v => {
+            clearTimeout(timer)
+            res(v === undefined ? undefined : v)
+          },
+          er => {
+            clearTimeout(timer)
+            rej(er)
+          },
         )
       } else if (fmp !== undefined) {
         res(fmp)
@@ -2810,6 +2892,7 @@ export class LRUCache<K extends {}, V extends {}, FC = unknown> {
       allowStaleOnFetchRejection = this.allowStaleOnFetchRejection,
       ignoreFetchAbort = this.ignoreFetchAbort,
       allowStaleOnFetchAbort = this.allowStaleOnFetchAbort,
+      staleFetchTimeout = this.staleFetchTimeout,
       context,
       forceRefresh = false,
       status,
@@ -2845,6 +2928,7 @@ export class LRUCache<K extends {}, V extends {}, FC = unknown> {
       allowStaleOnFetchRejection,
       allowStaleOnFetchAbort,
       ignoreFetchAbort,
+      staleFetchTimeout,
       status,
       signal,
     }
